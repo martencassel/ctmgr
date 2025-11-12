@@ -46,7 +46,8 @@ fetch_dockerhub_tags() {
 
   # Fetch from Docker Hub API - use temp file to avoid argument list too long
   local temp_file="$CACHE_DIR/${repo//\//_}_temp.json"
-  rm -f "$temp_file.items"
+  local temp_response="$CACHE_DIR/${repo//\//_}_response.json"
+  rm -f "$temp_file.items" "$temp_response"
 
   local url="https://registry.hub.docker.com/v2/repositories/library/${repo}/tags?page_size=100"
   local page_count=0
@@ -55,32 +56,35 @@ fetch_dockerhub_tags() {
   echo "Fetching $repo tags from Docker Hub..." >&2
 
   while [[ -n "$url" ]] && [[ $page_count -lt $max_pages ]]; do
-    local response=$(curl -s --max-time 10 "$url" 2>&1)
+    # Fetch to file first
+    if ! curl -s --max-time 15 "$url" -o "$temp_response"; then
+      echo "Error: curl failed (page $((page_count + 1)))" >&2
+      break
+    fi
 
-    # Check if curl succeeded and response is valid JSON
-    if [[ -z "$response" ]] || ! echo "$response" | jq -e '.results' >/dev/null 2>&1; then
-      echo "Error: Failed to fetch or parse response from Docker Hub API (page $((page_count + 1)))" >&2
+    # Check if response is valid JSON with results
+    if ! jq -e '.results' "$temp_response" >/dev/null 2>&1; then
+      echo "Error: Invalid JSON response (page $((page_count + 1)))" >&2
       if [[ $page_count -eq 0 ]]; then
-        # If first page fails, return empty array
         echo "[]" > "$cache_file"
         cat "$cache_file"
+        rm -f "$temp_response"
         return 1
       fi
-      # If subsequent pages fail, just stop and use what we have
       break
     fi
 
     # Extract results and append to temp file
-    echo "$response" | jq -c '.results[]' >> "$temp_file.items" 2>/dev/null
+    jq -c '.results[]' "$temp_response" >> "$temp_file.items" 2>/dev/null
 
     # Get next page URL
-    url=$(echo "$response" | jq -r '.next // empty' 2>/dev/null)
+    url=$(jq -r '.next // empty' "$temp_response" 2>/dev/null)
     page_count=$((page_count + 1))
     local tag_count=$(wc -l < "$temp_file.items" 2>/dev/null || echo 0)
     echo "  Fetched page $page_count ($tag_count tags)..." >&2
   done
 
-  # Combine all items into a single JSON array
+  rm -f "$temp_response"  # Combine all items into a single JSON array
   if [[ -f "$temp_file.items" ]]; then
     jq -s '.' "$temp_file.items" > "$cache_file"
     rm -f "$temp_file.items" "$temp_file"
