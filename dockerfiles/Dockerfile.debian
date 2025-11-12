@@ -1,0 +1,66 @@
+FROM debian:12.9
+
+ENV container docker
+
+ARG DEBIAN_MIRROR=""
+
+# Configure apt sources
+RUN if [ -n "$DEBIAN_MIRROR" ]; then \
+      echo "deb [trusted=yes] $DEBIAN_MIRROR bookworm main" > /etc/apt/sources.list && \
+      echo "deb [trusted=yes] $DEBIAN_MIRROR bookworm-updates main" >> /etc/apt/sources.list && \
+      echo "deb [trusted=yes] $DEBIAN_MIRROR bookworm-security main" >> /etc/apt/sources.list; \
+    else \
+      echo "deb http://deb.debian.org/debian bookworm main" > /etc/apt/sources.list && \
+      echo "deb http://deb.debian.org/debian bookworm-updates main" >> /etc/apt/sources.list && \
+      echo "deb http://security.debian.org/debian-security bookworm-security main" >> /etc/apt/sources.list; \
+    fi
+
+# Install systemd and essentials
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus \
+        openssh-server sudo \
+        ca-certificates gnupg python3 \
+        iputils-ping vim curl wget logrotate && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    command -v systemctl && \
+    command -v sshd && \
+    command -v python3
+
+# Mask services that break in containers
+RUN systemctl mask \
+      getty@.service \
+      getty.target \
+      dev-hugepages.mount \
+      sys-fs-fuse-connections.mount \
+      sys-kernel-config.mount \
+      sys-kernel-debug.mount \
+      sys-kernel-tracing.mount
+
+# Default target
+RUN systemctl set-default multi-user.target
+
+# Configure SSH for root login
+RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && \
+    echo 'root:password' | chpasswd && \
+    systemctl enable ssh
+
+# Build-time args
+ARG USERNAME=vmuser
+ARG PASSWORD=password
+
+# Create default user
+RUN useradd -m -s /bin/bash $USERNAME && \
+    echo "${USERNAME}:${PASSWORD}" | chpasswd && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Volumes for systemd
+VOLUME ["/sys/fs/cgroup", "/run", "/tmp"]
+
+
+# Proper shutdown
+STOPSIGNAL SIGRTMIN+3
+
+# Entrypoint: systemd
+ENTRYPOINT ["/lib/systemd/systemd"]

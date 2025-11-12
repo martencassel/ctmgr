@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+
+# ctmgr-distros - Discover available distro versions from various sources
+
+CACHE_DIR="$HOME/.ctmgr_cache"
+CACHE_EXPIRY=3600  # 1 hour in seconds
+mkdir -p "$CACHE_DIR"
+
+usage() {
+  echo "Usage: ctmgr-distros <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  list [--distro <name>] [--format <table|json>]"
+  echo "      List available distro versions"
+  echo ""
+  echo "  search <query> [--format <table|json>]"
+  echo "      Search for distro versions matching query"
+  echo ""
+  echo "  tags --distro <name> [--source <dockerhub|official>] [--format <table|json>]"
+  echo "      List all tags for a specific distro"
+  echo ""
+  echo "  refresh"
+  echo "      Clear cache and force refresh"
+  echo ""
+  echo "Supported distros: debian, ubuntu, centos, fedora, alpine, rockylinux"
+  echo ""
+  echo "Examples:"
+  echo "  ctmgr-distros list --distro debian"
+  echo "  ctmgr-distros tags --distro debian --source dockerhub --format json"
+  echo "  ctmgr-distros search bookworm"
+}
+
+# Fetch Docker Hub tags for a repository
+fetch_dockerhub_tags() {
+  local repo="$1"
+  local cache_file="$CACHE_DIR/${repo//\//_}_tags.json"
+
+  # Check cache
+  if [[ -f "$cache_file" ]]; then
+    local age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %Y "$cache_file" 2>/dev/null)))
+    if [[ $age -lt $CACHE_EXPIRY ]]; then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+
+  # Fetch from Docker Hub API - use temp file to avoid argument list too long
+  local temp_file="$CACHE_DIR/${repo//\//_}_temp.json"
+  rm -f "$temp_file.items"
+
+  local url="https://registry.hub.docker.com/v2/repositories/library/${repo}/tags?page_size=100"
+  local page_count=0
+  local max_pages=5  # Limit to 5 pages (500 tags) for performance
+
+  echo "Fetching $repo tags from Docker Hub..." >&2
+
+  while [[ -n "$url" ]] && [[ $page_count -lt $max_pages ]]; do
+    local response=$(curl -s --max-time 10 "$url" 2>&1)
+
+    # Check if curl succeeded and response is valid JSON
+    if [[ -z "$response" ]] || ! echo "$response" | jq -e '.results' >/dev/null 2>&1; then
+      echo "Error: Failed to fetch or parse response from Docker Hub API (page $((page_count + 1)))" >&2
+      if [[ $page_count -eq 0 ]]; then
+        # If first page fails, return empty array
+        echo "[]" > "$cache_file"
+        cat "$cache_file"
+        return 1
+      fi
+      # If subsequent pages fail, just stop and use what we have
+      break
+    fi
+
+    # Extract results and append to temp file
+    echo "$response" | jq -c '.results[]' >> "$temp_file.items" 2>/dev/null
+
+    # Get next page URL
+    url=$(echo "$response" | jq -r '.next // empty' 2>/dev/null)
+    page_count=$((page_count + 1))
+    local tag_count=$(wc -l < "$temp_file.items" 2>/dev/null || echo 0)
+    echo "  Fetched page $page_count ($tag_count tags)..." >&2
+  done
+
+  # Combine all items into a single JSON array
+  if [[ -f "$temp_file.items" ]]; then
+    jq -s '.' "$temp_file.items" > "$cache_file"
+    rm -f "$temp_file.items" "$temp_file"
+    echo "  Cached $(jq 'length' "$cache_file") tags" >&2
+  else
+    echo "[]" > "$cache_file"
+  fi
+
+  cat "$cache_file"
+}
+
+# Get Debian versions
+get_debian_versions() {
+  local format="${1:-table}"
+  fetch_dockerhub_tags "debian" > "$CACHE_DIR/temp_processing.json"
+
+  if [[ "$format" == "json" ]]; then
+    jq '[.[] | select(.name | test("^[0-9]+\\.[0-9]+$   |^[0-9]+-slim$|bookworm|bullseye|buster")) | {
+      version: .name,
+      last_updated: .last_updated,
+      size_mb: (.full_size / 1024 / 1024 | round)
+    }] | sort_by(.version) | reverse' "$CACHE_DIR/temp_processing.json"
+  else
+    echo "Debian Versions (from Docker Hub)"
+    echo "=================================="
+    printf "%-20s %-25s %10s\n" "VERSION" "LAST UPDATED" "SIZE (MB)"
+    jq -r '.[] | select(.name | test("^[0-9]+\\.[0-9]+$|^[0-9]+-slim$|bookworm|bullseye|buster")) |
+      [.name, .last_updated[:19], (.full_size / 1024 / 1024 | round | tostring)] | @tsv' "$CACHE_DIR/temp_processing.json" |
+      sort -V -r |
+      while IFS=$'\t' read -r version updated size; do
+        printf "%-20s %-25s %10s\n" "$version" "$updated" "$size"
+      done
+  fi
+  rm -f "$CACHE_DIR/temp_processing.json"
+}
+
+# Get Ubuntu versions
+get_ubuntu_versions() {
+  local format="${1:-table}"
+  fetch_dockerhub_tags "ubuntu" > "$CACHE_DIR/temp_processing.json"
+
+  if [[ "$format" == "json" ]]; then
+    jq '[.[] | select(.name | test("^[0-9]+\\.[0-9]+$|jammy|focal|noble|mantic")) | {
+      version: .name,
+      last_updated: .last_updated,
+      size_mb: (.full_size / 1024 / 1024 | round)
+    }] | sort_by(.version) | reverse' "$CACHE_DIR/temp_processing.json"
+  else
+    echo "Ubuntu Versions (from Docker Hub)"
+    echo "=================================="
+    printf "%-20s %-25s %10s\n" "VERSION" "LAST UPDATED" "SIZE (MB)"
+    jq -r '.[] | select(.name | test("^[0-9]+\\.[0-9]+$|jammy|focal|noble|mantic")) |
+      [.name, .last_updated[:19], (.full_size / 1024 / 1024 | round | tostring)] | @tsv' "$CACHE_DIR/temp_processing.json" |
+      sort -V -r |
+      while IFS=$'\t' read -r version updated size; do
+        printf "%-20s %-25s %10s\n" "$version" "$updated" "$size"
+      done
+  fi
+  rm -f "$CACHE_DIR/temp_processing.json"
+}
+
+# Get Fedora versions
+get_fedora_versions() {
+  local format="${1:-table}"
+  fetch_dockerhub_tags "fedora" > "$CACHE_DIR/temp_processing.json"
+
+  if [[ "$format" == "json" ]]; then
+    jq '[.[] | select(.name | test("^[0-9]+$|^rawhide$")) | {
+      version: .name,
+      last_updated: .last_updated,
+      size_mb: (.full_size / 1024 / 1024 | round)
+    }] | sort_by(.version) | reverse' "$CACHE_DIR/temp_processing.json"
+  else
+    echo "Fedora Versions (from Docker Hub)"
+    echo "=================================="
+    printf "%-20s %-25s %10s\n" "VERSION" "LAST UPDATED" "SIZE (MB)"
+    jq -r '.[] | select(.name | test("^[0-9]+$|^rawhide$")) |
+      [.name, .last_updated[:19], (.full_size / 1024 / 1024 | round | tostring)] | @tsv' "$CACHE_DIR/temp_processing.json" |
+      sort -V -r |
+      while IFS=$'\t' read -r version updated size; do
+        printf "%-20s %-25s %10s\n" "$version" "$updated" "$size"
+      done
+  fi
+  rm -f "$CACHE_DIR/temp_processing.json"
+}
+
+# Get Alpine versions
+get_alpine_versions() {
+  local format="${1:-table}"
+  fetch_dockerhub_tags "alpine" > "$CACHE_DIR/temp_processing.json"
+
+  if [[ "$format" == "json" ]]; then
+    jq '[.[] | select(.name | test("^[0-9]+\\.[0-9]+$|^3\\.[0-9]+\\.[0-9]+$|^edge$")) | {
+      version: .name,
+      last_updated: .last_updated,
+      size_mb: (.full_size / 1024 / 1024 | round)
+    }] | sort_by(.version) | reverse' "$CACHE_DIR/temp_processing.json"
+  else
+    echo "Alpine Versions (from Docker Hub)"
+    echo "=================================="
+    printf "%-20s %-25s %10s\n" "VERSION" "LAST UPDATED" "SIZE (MB)"
+    jq -r '.[] | select(.name | test("^[0-9]+\\.[0-9]+$|^3\\.[0-9]+\\.[0-9]+$|^edge$")) |
+      [.name, .last_updated[:19], (.full_size / 1024 / 1024 | round | tostring)] | @tsv' "$CACHE_DIR/temp_processing.json" |
+      sort -V -r |
+      while IFS=$'\t' read -r version updated size; do
+        printf "%-20s %-25s %10s\n" "$version" "$updated" "$size"
+      done
+  fi
+  rm -f "$CACHE_DIR/temp_processing.json"
+}
+
+# List all distros or specific distro
+list_distros() {
+  local distro format
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --distro) distro="$2"; shift ;;
+      --format) format="$2"; shift ;;
+    esac
+    shift
+  done
+
+  format="${format:-table}"
+
+  if [[ -z "$distro" ]]; then
+    # List all supported distros
+    if [[ "$format" == "json" ]]; then
+      cat <<EOF
+{
+  "supported_distros": ["debian", "ubuntu", "fedora", "alpine", "centos", "rockylinux"],
+  "note": "Use --distro <name> to see available versions"
+}
+EOF
+    else
+      echo "Supported Distros"
+      echo "================="
+      echo "  - debian"
+      echo "  - ubuntu"
+      echo "  - fedora"
+      echo "  - alpine"
+      echo "  - centos"
+      echo "  - rockylinux"
+      echo ""
+      echo "Use: ctmgr-distros list --distro <name> to see versions"
+    fi
+  else
+    case "$distro" in
+      debian) get_debian_versions "$format" ;;
+      ubuntu) get_ubuntu_versions "$format" ;;
+      fedora) get_fedora_versions "$format" ;;
+      alpine) get_alpine_versions "$format" ;;
+      *)
+        echo "Distro '$distro' not yet implemented. Supported: debian, ubuntu, fedora, alpine"
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+# Search across all distros
+search_distros() {
+  local query="$1"
+  local format="${2:-table}"
+
+  [[ -z "$query" ]] && { echo "Search query required"; exit 1; }
+
+  if [[ "$format" == "json" ]]; then
+    echo '{"results": ['
+    local first=true
+    for distro in debian ubuntu fedora alpine; do
+      local tags=$(fetch_dockerhub_tags "$distro")
+      local matches=$(echo "$tags" | jq --arg q "$query" '[.[] | select(.name | contains($q)) | {distro: "'$distro'", version: .name, last_updated: .last_updated}]')
+      if [[ $(echo "$matches" | jq 'length') -gt 0 ]]; then
+        [[ "$first" == false ]] && echo ","
+        echo "$matches" | jq -c '.[]'
+        first=false
+      fi
+    done
+    echo ']}'
+  else
+    echo "Search results for: $query"
+    echo "=========================="
+    printf "%-15s %-20s %-25s\n" "DISTRO" "VERSION" "LAST UPDATED"
+    for distro in debian ubuntu fedora alpine; do
+      local tags=$(fetch_dockerhub_tags "$distro")
+      echo "$tags" | jq -r --arg q "$query" '.[] | select(.name | contains($q)) |
+        ["'$distro'", .name, .last_updated[:19]] | @tsv' |
+        while IFS=$'\t' read -r d v u; do
+          printf "%-15s %-20s %-25s\n" "$d" "$v" "$u"
+        done
+    done
+  fi
+}
+
+# List all tags for a distro
+list_tags() {
+  local distro source format
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --distro) distro="$2"; shift ;;
+      --source) source="$2"; shift ;;
+      --format) format="$2"; shift ;;
+    esac
+    shift
+  done
+
+  [[ -z "$distro" ]] && { echo "Distro required (--distro <name>)"; exit 1; }
+  format="${format:-table}"
+  source="${source:-dockerhub}"
+
+  local tags=$(fetch_dockerhub_tags "$distro")
+
+  if [[ "$format" == "json" ]]; then
+    echo "$tags" | jq '[.[] | {
+      name: .name,
+      last_updated: .last_updated,
+      size_mb: (.full_size / 1024 / 1024 | round),
+      digest: .images[0].digest
+    }]'
+  else
+    echo "All tags for $distro (source: $source)"
+    echo "========================================"
+    printf "%-30s %-25s %10s\n" "TAG" "LAST UPDATED" "SIZE (MB)"
+    echo "$tags" | jq -r '.[] | [.name, .last_updated[:19], (.full_size / 1024 / 1024 | round | tostring)] | @tsv' |
+      while IFS=$'\t' read -r tag updated size; do
+        printf "%-30s %-25s %10s\n" "$tag" "$updated" "$size"
+      done
+  fi
+}
+
+# Refresh cache
+refresh_cache() {
+  echo "Clearing cache..."
+  rm -rf "$CACHE_DIR"/*
+  echo "✓ Cache cleared"
+}
+
+# Check dependencies
+check_deps() {
+  for cmd in curl jq; do
+    if ! command -v "$cmd" &> /dev/null; then
+      echo "Error: $cmd is required but not installed"
+      exit 1
+    fi
+  done
+}
+
+# Main dispatch
+check_deps
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+  list) list_distros "$@" ;;
+  search) search_distros "$@" ;;
+  tags) list_tags "$@" ;;
+  refresh) refresh_cache ;;
+  -h|--help|"") usage ;;
+  *) echo "Unknown command: $cmd"; usage; exit 1 ;;
+esac

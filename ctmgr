@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${HOME}/.ctmgr_state"
+POOL_FILE="${HOME}/.ctmgr_pools"
+mkdir -p "$(dirname "${STATE_FILE}")"
+touch "${STATE_FILE}"
+touch "${POOL_FILE}"
+
+# Default curated tags (fallbacks when pool not yet built/recorded)
+declare -A POOLS=(
+  ["debian"]="debian-systemd:latest"
+  ["ubuntu"]="ubuntu-systemd:latest"
+  ["centos"]="centos-systemd:latest"
+  ["fedora"]="fedora-systemd:latest"
+)
+
+usage() {
+  cat <<EOF
+Usage: ctmgr <command> [options]
+
+Commands:
+  alloc --pool <pool> --name <name> [--count N]
+  release <name>
+  list
+  render-compose --pool <pool> --count N [--image <tag>] [--subnet CIDR] [--gateway IP] [--base-ip IP] [--entrypoint CMD]
+  pool build --pool <pool> [--dockerfile <path>] [--user <username>] [--password <password>] [--mirror <url>] [--image <tag>]
+  pool list
+  pool inspect --pool <pool>
+  pool remove --pool <pool>
+EOF
+}
+
+# --- Helpers ---
+get_image_for_pool() {
+  # Prefer last recorded image in POOL_FILE; fallback to POOLS default.
+  local pool="$1"
+  local recorded
+  recorded=$(awk -F, -v p="${pool}" '$1==p {img=$2} END {if (img!="") print img}' "${POOL_FILE}")
+  if [[ -n "${recorded}" ]]; then
+    echo "${recorded}"
+  else
+    echo "${POOLS[${pool}]:-}"
+  fi
+}
+
+ensure_known_pool() {
+  local pool="$1"
+  if [[ -z "${POOLS[${pool}]:-}" ]]; then
+    echo "Unknown pool: ${pool}"
+    exit 1
+  fi
+}
+
+# --- Commands ---
+alloc() {
+  local pool="" name="" count=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool) pool="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --count) count="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "${pool}" ]] && { echo "Pool required"; exit 1; }
+  [[ -z "${name}" && -z "${count}" ]] && { echo "Name or count required"; exit 1; }
+  ensure_known_pool "${pool}"
+
+  local image
+  image="$(get_image_for_pool "${pool}")"
+  [[ -z "${image}" ]] && { echo "No image configured for pool '${pool}'"; exit 1; }
+
+  if [[ -n "${count}" ]]; then
+    for i in $(seq 1 "${count}"); do
+      local cname="${pool}_vm${i}"
+      echo "${cname},${pool},${image}" >> "${STATE_FILE}"
+      echo "✓ Allocated ${cname} (${image})"
+    done
+  else
+    echo "${name},${pool},${image}" >> "${STATE_FILE}"
+    echo "✓ Allocated ${name} (${image})"
+  fi
+}
+
+release() {
+  local name="${1:-}"
+  [[ -z "${name}" ]] && { echo "Name required"; exit 1; }
+  grep -v "^${name}," "${STATE_FILE}" > "${STATE_FILE}.tmp" || true
+  mv "${STATE_FILE}.tmp" "${STATE_FILE}"
+  echo "✓ Released ${name}"
+}
+
+list() {
+  echo "Managed containers:"
+  if [[ -s "${STATE_FILE}" ]]; then
+    awk -F, '{printf " - %s (%s)\n", $1, $2}' "${STATE_FILE}"
+  else
+    echo " - (none)"
+  fi
+}
+
+render_compose() {
+  local pool="" count="" image="" subnet="10.5.0.0/16" gateway="10.5.0.1" base_ip="10.5.0.10" entrypoint="/lib/systemd/systemd"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool) pool="$2"; shift 2 ;;
+      --count) count="$2"; shift 2 ;;
+      --image) image="$2"; shift 2 ;;
+      --subnet) subnet="$2"; shift 2 ;;
+      --gateway) gateway="$2"; shift 2 ;;
+      --base-ip) base_ip="$2"; shift 2 ;;
+      --entrypoint) entrypoint="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "${pool}" || -z "${count}" ]] && { echo "Pool and count required"; exit 1; }
+  ensure_known_pool "${pool}"
+  [[ -z "${image}" ]] && image="$(get_image_for_pool "${pool}")"
+  [[ -z "${image}" ]] && { echo "No image configured for pool '${pool}'"; exit 1; }
+
+  # Compose output (avoid unsupported 'cgroupns' and invalid 'cgroup' keys)
+  cat <<EOF
+version: '3.9'
+services:
+EOF
+
+  # Convert base_ip to prefix and starting host last octet
+  IFS='.' read -r bip1 bip2 bip3 bip4 <<< "${base_ip}"
+  local start_octet="${bip4}"
+
+  for i in $(seq 1 "${count}"); do
+    local cname="${pool}_vm${i}"
+    local ip="${bip1}.${bip2}.${bip3}.$((start_octet + i))"
+    cat <<EOF
+  ${cname}:
+    image: ${image}
+    container_name: ${cname}
+    privileged: true
+    cgroup: host
+    entrypoint: ["${entrypoint}"]
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /tmp
+    networks:
+      vmnet:
+        ipv4_address: ${ip}
+EOF
+  done
+
+  cat <<EOF
+networks:
+  vmnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${subnet}
+          gateway: ${gateway}
+EOF
+}
+
+pool_build() {
+  local pool="" dockerfile="" user="" password="" mirror="" image=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool) pool="$2"; shift 2 ;;
+      --dockerfile) dockerfile="$2"; shift 2 ;;
+      --user) user="$2"; shift 2 ;;
+      --password) password="$2"; shift 2 ;;
+      --mirror) mirror="$2"; shift 2 ;;
+      --image) image="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "${pool}" ]] && { echo "Pool required"; exit 1; }
+  ensure_known_pool "${pool}"
+  [[ -z "${image}" ]] && image="$(get_image_for_pool "${pool}")"
+  [[ -z "${image}" ]] && image="${POOLS[${pool}]}"
+  [[ -z "${dockerfile}" ]] && dockerfile="./dockerfiles/Dockerfile.${pool}"
+
+  local build_cmd=(docker build -t "${image}" -f "${dockerfile}")
+  [[ -n "${user}" ]] && build_cmd+=(--build-arg "USERNAME=${user}")
+  [[ -n "${password}" ]] && build_cmd+=(--build-arg "PASSWORD=${password}")
+  [[ -n "${mirror}" ]] && build_cmd+=(--build-arg "DEBIAN_MIRROR=${mirror}")
+  build_cmd+=(.)
+
+  echo "Building ${pool} image (${image}) from ${dockerfile}..."
+  [[ -n "${user}" ]] && echo "  Using custom username: ${user}"
+  [[ -n "${password}" ]] && echo "  Using custom password: ***"
+  [[ -n "${mirror}" ]] && echo "  Using custom Debian mirror: ${mirror}"
+
+  "${build_cmd[@]}"
+
+  # Update POOL_FILE mapping (dedupe previous entry for pool)
+  grep -v "^${pool}," "${POOL_FILE}" > "${POOL_FILE}.tmp" || true
+  mv "${POOL_FILE}.tmp" "${POOL_FILE}"
+  echo "${pool},${image},${dockerfile}" >> "${POOL_FILE}"
+  echo "✓ Built ${image}"
+}
+
+pool_list() {
+  echo "Available pools:"
+  if [[ -s "${POOL_FILE}" ]]; then
+    awk -F, '{printf " - %s → %s (Dockerfile: %s)\n", $1, $2, $3}' "${POOL_FILE}"
+  else
+    # Show defaults if nothing recorded yet
+    for p in "${!POOLS[@]}"; do
+      printf " - %s → %s (Dockerfile: ./dockerfiles/Dockerfile.%s)\n" "$p" "${POOLS[$p]}" "$p"
+    done
+  fi
+}
+
+pool_inspect() {
+  local pool=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool) pool="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  [[ -z "${pool}" ]] && { echo "Pool required"; exit 1; }
+  ensure_known_pool "${pool}"
+
+  local image
+  image="$(get_image_for_pool "${pool}")"
+  [[ -z "${image}" ]] && { echo "No image configured for pool '${pool}'"; exit 1; }
+
+  docker inspect "${image}" | jq '.[0] | {Id, RepoTags, Config: {Entrypoint, Env}}'
+}
+
+pool_remove() {
+  local pool=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pool) pool="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  [[ -z "${pool}" ]] && { echo "Pool required"; exit 1; }
+  ensure_known_pool "${pool}"
+
+  local image
+  image="$(get_image_for_pool "${pool}")"
+  [[ -z "${image}" ]] && image="${POOLS[${pool}]}"
+
+  if [[ -n "${image}" ]]; then
+    docker rmi "${image}" || true
+  fi
+  grep -v "^${pool}," "${POOL_FILE}" > "${POOL_FILE}.tmp" || true
+  mv "${POOL_FILE}.tmp" "${POOL_FILE}"
+  echo "✓ Removed pool ${pool} (${image})"
+}
+
+# --- Dispatch ---
+cmd="${1:-}"; shift || true
+case "${cmd}" in
+  alloc) alloc "$@" ;;
+  release) release "$@" ;;
+  list) list ;;
+  render-compose) render_compose "$@" ;;
+  pool)
+    sub="${1:-}"; shift || true
+    case "${sub}" in
+      build) pool_build "$@" ;;
+      list) pool_list ;;
+      inspect) pool_inspect "$@" ;;
+      remove) pool_remove "$@" ;;
+      *) usage ;;
+    esac
+    ;;
+  *) usage ;;
+esac
