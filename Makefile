@@ -14,6 +14,10 @@ PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 DOCDIR = $(PREFIX)/share/doc/ctmgr
 
+# Detect if sudo is needed
+NEEDS_SUDO := $(shell test -w $(dir $(BINDIR)) 2>/dev/null || echo "sudo")
+INSTALL := $(NEEDS_SUDO) install
+
 # Project files
 SCRIPTS = ctmgr ctmgr-distros
 DOCS = README.md DISTROS.md
@@ -40,29 +44,40 @@ install: check-deps install-scripts install-docs ## Install ctmgr and ctmgr-dist
 	@echo "$(GREEN)✓$(NC) Installation complete!"
 	@echo "$(BLUE)→$(NC) Scripts installed to: $(CYAN)$(BINDIR)$(NC)"
 	@echo "$(BLUE)→$(NC) Documentation installed to: $(CYAN)$(DOCDIR)$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Try it:$(NC) ctmgr --help"
 
 .PHONY: install-scripts
 install-scripts: ## Install executables only
+	@if [ ! -w "$(dir $(BINDIR))" ]; then \
+		echo "$(YELLOW)→$(NC) Installation requires sudo privileges..."; \
+	fi
 	@echo "$(BLUE)→$(NC) Installing scripts to $(CYAN)$(BINDIR)$(NC)..."
-	@install -d $(BINDIR)
-	@install -m 755 ctmgr $(BINDIR)/ctmgr
-	@install -m 755 ctmgr-distros $(BINDIR)/ctmgr-distros
+	@$(INSTALL) -d $(BINDIR)
+	@$(INSTALL) -m 755 ctmgr $(BINDIR)/ctmgr
+	@$(INSTALL) -m 755 ctmgr-distros $(BINDIR)/ctmgr-distros
 	@echo "$(GREEN)✓$(NC) Scripts installed"
 
 .PHONY: install-docs
 install-docs: ## Install documentation only
+	@if [ ! -w "$(dir $(DOCDIR))" ]; then \
+		echo "$(YELLOW)→$(NC) Documentation installation requires sudo privileges..."; \
+	fi
 	@echo "$(BLUE)→$(NC) Installing documentation to $(CYAN)$(DOCDIR)$(NC)..."
-	@install -d $(DOCDIR)
-	@install -m 644 README.md $(DOCDIR)/README.md
-	@install -m 644 DISTROS.md $(DOCDIR)/DISTROS.md
+	@$(INSTALL) -d $(DOCDIR)
+	@$(INSTALL) -m 644 README.md $(DOCDIR)/README.md
+	@$(INSTALL) -m 644 DISTROS.md $(DOCDIR)/DISTROS.md
 	@echo "$(GREEN)✓$(NC) Documentation installed"
 
 .PHONY: uninstall
 uninstall: ## Remove ctmgr from system
+	@if [ ! -w "$(BINDIR)" ] || [ ! -w "$(dir $(DOCDIR))" ]; then \
+		echo "$(YELLOW)→$(NC) Uninstallation requires sudo privileges..."; \
+	fi
 	@echo "$(YELLOW)→$(NC) Uninstalling ctmgr..."
-	@rm -f $(BINDIR)/ctmgr
-	@rm -f $(BINDIR)/ctmgr-distros
-	@rm -rf $(DOCDIR)
+	@$(NEEDS_SUDO) rm -f $(BINDIR)/ctmgr
+	@$(NEEDS_SUDO) rm -f $(BINDIR)/ctmgr-distros
+	@$(NEEDS_SUDO) rm -rf $(DOCDIR)
 	@echo "$(GREEN)✓$(NC) Uninstallation complete"
 
 ##@ Development
